@@ -1,0 +1,137 @@
+version: "3.8"
+
+# SigNoz Self-Hosted Demo Stack
+# UI: http://localhost:8080
+# OTLP gRPC: localhost:4317
+# OTLP HTTP: localhost:4318
+
+services:
+
+  # ── ZooKeeper (ClickHouse coordination) ──────────────────────────────────
+  zookeeper:
+    image: signoz/zookeeper:3.7.1
+    container_name: signoz-zookeeper
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    volumes:
+      - zookeeper-data:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -m 2 http://localhost:8080/commands/ruok | grep error | grep null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── ClickHouse (telemetry storage) ───────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12.5
+    container_name: signoz-clickhouse
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - ./config/clickhouse/config.xml:/etc/clickhouse-server/config.d/config.xml
+      - ./config/clickhouse/users.xml:/etc/clickhouse-server/users.d/users.xml
+      - ./config/clickhouse/custom-function.xml:/etc/clickhouse-server/custom-function.xml
+      - clickhouse-data:/var/lib/clickhouse/
+      - clickhouse-scripts:/var/lib/clickhouse/user_scripts/
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "0.0.0.0:8123/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Schema migrator (runs once, then exits) ───────────────────────────────
+  telemetrystore-migrator:
+    image: signoz/signoz-otel-collector:latest
+    container_name: signoz-migrator
+    entrypoint: ["/bin/sh"]
+    command:
+      - -c
+      - |
+        echo "Running ClickHouse schema migrations..." &&
+        /signoz-otel-collector migrate bootstrap &&
+        /signoz-otel-collector migrate sync up &&
+        /signoz-otel-collector migrate async up &&
+        echo "Migrations complete."
+    environment:
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN=tcp://clickhouse:9000
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER=cluster
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=true
+      - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── OTel Collector (receives traces/metrics/logs from apps) ──────────────
+  signoz-otel-collector:
+    image: signoz/signoz-otel-collector:latest
+    container_name: signoz-otel-collector
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel/config.yaml
+    environment:
+      - OTEL_RESOURCE_ATTRIBUTES=host.name=signoz-host,os.type=linux
+      - LOW_CARDINAL_EXCEPTION_GROUPING=false
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN=tcp://clickhouse:9000
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER=cluster
+      - SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=true
+      - SIGNOZ_OTEL_COLLECTOR_TIMEOUT=10m
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health check
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "localhost:13133"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      telemetrystore-migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── SigNoz Backend + UI ──────────────────────────────────────────────────
+  signoz:
+    image: signoz/signoz:latest
+    container_name: signoz
+    command: ["--config", "/etc/signoz/signoz.yaml"]
+    volumes:
+      - ./config/signoz.yaml:/etc/signoz/signoz.yaml
+      - signoz-data:/var/lib/signoz/
+    ports:
+      - "8080:8080"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      signoz-otel-collector:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Demo FastAPI App (generates realistic traces + logs) ─────────────────
+  catalog-api:
+    image: signoz/sample-fastapi-with-db:latest
+    container_name: catalog-api
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://signoz-otel-collector:4317
+      - OTEL_SERVICE_NAME=catalog-api
+      - OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production,service.version=1.0.0
+      - OTEL_EXPORTER_OTLP_INSECURE=true
+    ports:
+      - "5000:5000"
+    depends_on:
+      signoz-otel-collector:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  zookeeper-data:
+  clickhouse-data:
+  clickhouse-scripts:
+  signoz-data:

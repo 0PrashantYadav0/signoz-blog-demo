@@ -1,0 +1,49 @@
+global:
+  external_url: http://localhost:8080
+
+web:
+  enabled: true
+  index: index.html
+  directory: /etc/signoz/web
+
+sqlstore:
+  provider: sqlite
+  sqlite:
+    path: /var/lib/signoz/signoz.db
+    mode: wal
+    busy_timeout: 10s
+    transaction_mode: immediate
+
+telemetrystore:
+  provider: clickhouse
+  clickhouse:
+    dsn: tcp://clickhouse:9000
+    cluster: cluster
+    settings:
+      max_execution_time: 0
+
+alertmanager:
+  provider: signoz
+  signoz:
+    poll_interval: 1m
+    external_url: http://localhost:8080
+    templates:
+      - /root/templates/alertmanager/*.gotmpl
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: [alertname]
+      group_interval: 1m
+      group_wait: 1m
+      repeat_interval: 1h
+
+tokenizer:
+  provider: jwt
+  jwt:
+    secret: signoz-blog-demo-secret-2026
+
+analytics:
+  enabled: false
+
+statsreporter:
+  enabled: false
